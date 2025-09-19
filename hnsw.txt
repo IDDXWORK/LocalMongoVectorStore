@@ -1,0 +1,154 @@
+You can build a scalable, self-hosted hybrid search system similar to a native vector database's pre-filtering capabilities by implementing a more advanced architecture that avoids moving all the filtered data into memory for each query. This involves using **FAISS on-disk indexing** and a **persistent mapping layer**.
+
+The core idea is to move beyond the in-memory limitations of the previous approach. You'll build a single, large, on-disk HNSW index. Instead of loading filtered embeddings to a temporary index, you'll perform a two-step lookup:
+
+1.  **MongoDB Filter:** Get a list of document IDs that match your metadata filter.
+2.  **FAISS ID-based Search:** Use these IDs to perform a targeted search directly on the main, on-disk HNSW index.
+
+This approach bypasses the memory and processing overhead of creating temporary indices for each query, making it scalable for datasets with millions of vectors.
+
+-----
+
+### 1\. Build and Persist the Main HNSW Index
+
+First, you'll build the HNSW index for your entire dataset and save it to a file. This is a one-time operation.
+
+```python
+import faiss
+import numpy as np
+import os
+import pickle
+from pymongo import MongoClient
+
+# Assumes you have your MongoDB collection populated
+client = MongoClient("mongodb://localhost:27017/")
+collection = client["my_vector_db"]["documents"]
+
+# Retrieve all documents to build the index
+print("Fetching all documents...")
+all_docs = list(collection.find({}, projection={"embedding": 1, "_id": 1}))
+
+if not all_docs:
+    print("No documents found to index.")
+    exit()
+
+embeddings = np.array([doc["embedding"] for doc in all_docs]).astype("float32")
+faiss_ids = np.array(range(len(all_docs))).astype("int64")
+
+# Store the mapping from FAISS ID to MongoDB _id
+print("Building ID mapping...")
+faiss_to_mongo_id = {i: str(doc["_id"]) for i, doc in enumerate(all_docs)}
+
+# Create and populate the HNSW index
+print("Building HNSW index...")
+M = 32
+hnsw_index = faiss.IndexHNSWFlat(embeddings.shape[1], M)
+hnsw_index.add_with_ids(embeddings, faiss_ids)
+
+# Save the FAISS index to disk
+print("Saving index and mapping to disk...")
+faiss_file = "my_hnsw_index.faiss"
+faiss.write_index(hnsw_index, faiss_file)
+
+# Save the ID mapping to disk for persistent use
+with open("faiss_to_mongo_id.pkl", "wb") as f:
+    pickle.dump(faiss_to_mongo_id, f)
+
+print(f"HNSW index saved to '{faiss_file}'.")
+```
+
+-----
+
+### 2\. Load the Index and Mapping for Querying
+
+In your application, you will load the saved FAISS index and the ID mapping into memory at startup. This is the **crucial part** that allows you to perform fast searches without rebuilding the index every time.
+
+```python
+import faiss
+import pickle
+import numpy as np
+from pymongo import MongoClient
+
+# Load the saved FAISS index
+print("Loading FAISS index...")
+faiss_file = "my_hnsw_index.faiss"
+hnsw_index = faiss.read_index(faiss_file)
+
+# Load the ID mapping
+print("Loading ID mapping...")
+with open("faiss_to_mongo_id.pkl", "rb") as f:
+    faiss_to_mongo_id = pickle.load(f)
+
+# Create a reverse mapping for efficient lookups from Mongo _id to FAISS ID
+mongo_to_faiss_id = {v: k for k, v in faiss_to_mongo_id.items()}
+
+# Connect to MongoDB
+client = MongoClient("mongodb://localhost:27017/")
+collection = client["my_vector_db"]["documents"]
+```
+
+-----
+
+### 3\. Implement the Scalable Hybrid Search Function
+
+The search function now combines MongoDB's filtering with a targeted FAISS query on the pre-loaded index. This is where the efficiency comes from.
+
+```python
+def scalable_hybrid_search(query_embedding, filter_criteria, k=5):
+    """
+    Performs a scalable hybrid search using a pre-loaded HNSW index.
+    """
+    # 1. Pre-filter in MongoDB to get a list of document IDs
+    # This is an efficient database-level operation
+    print("Step 1: Filtering documents in MongoDB...")
+    filtered_docs = list(collection.find(filter_criteria, projection={"_id": 1}))
+
+    if not filtered_docs:
+        print("No documents matched the filter criteria.")
+        return []
+
+    # 2. Map MongoDB _ids to FAISS internal IDs using the pre-loaded mapping
+    print("Step 2: Mapping MongoDB IDs to FAISS IDs...")
+    filtered_faiss_ids = np.array([
+        mongo_to_faiss_id[str(doc["_id"])] 
+        for doc in filtered_docs if str(doc["_id"]) in mongo_to_faiss_id
+    ]).astype("int64")
+
+    if not filtered_faiss_ids.size:
+        print("No FAISS IDs found for the filtered documents.")
+        return []
+
+    # 3. Perform the search on the filtered subset using HNSW's search_with_ids
+    # This avoids building a new index and operates on the main, in-memory graph
+    print("Step 3: Performing FAISS search on the subset...")
+    query_embedding_np = np.array([query_embedding]).astype("float32")
+    
+    # HNSW parameter to control search time vs. accuracy tradeoff
+    hnsw_index.hnsw.efSearch = 128
+    
+    distances, indices = hnsw_index.search_with_ids(query_embedding_np, k, filtered_faiss_ids)
+
+    # 4. Map the results back to MongoDB documents and retrieve full data
+    print("Step 4: Mapping results back to MongoDB documents...")
+    result_faiss_ids = [idx for idx in indices[0] if idx != -1]
+    result_mongo_ids = [faiss_to_mongo_id[idx] for idx in result_faiss_ids]
+    
+    # Final retrieval from MongoDB
+    results = list(collection.find({"_id": {"$in": result_mongo_ids}}))
+    
+    return results
+
+# --- Example Usage ---
+# Simulate a query and a filter
+query_vec = np.random.rand(1536).tolist()
+my_filter = {"category": "pets"}
+
+# Perform the hybrid search
+search_results = scalable_hybrid_search(query_vec, my_filter, k=2)
+
+print("\nSearch results (filtered by 'pets' category):")
+for doc in search_results:
+    print(f"Content: {doc['content']}, Category: {doc['category']}")
+```
+
+This architecture, while self-built, replicates the core functionality of a native vector database. The FAISS index and ID mapping are loaded once, and subsequent queries only involve a fast MongoDB filter and an even faster FAISS lookup, making it highly scalable for large datasets.

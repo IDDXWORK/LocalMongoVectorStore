@@ -1,0 +1,146 @@
+While the previous answers showed how to build a scalable pre-filtering system, replicating Atlas's **pre-filtering and post-filtering** capabilities requires a more nuanced approach. Atlas's `$vectorSearch` aggregation stage is a powerful native feature that allows you to combine vector search with other aggregation stages, including filters. To replicate this locally, you must use a similar, multi-stage pipeline logic in your application.
+
+Here's how to implement a local, self-hosted version of Atlas's pre-filtering and post-filtering using MongoDB and FAISS.
+
+### Pre-Filtering and Post-Filtering Logic
+
+  * **Pre-filtering** is crucial for performance. It's when you narrow down your dataset **before** performing the vector search. This reduces the number of documents FAISS has to consider, making the search faster and more accurate since it's working on a more relevant subset. In your local implementation, this is the MongoDB `find` query.
+  * **Post-filtering** is for refining the results **after** the vector search. You use it to apply additional criteria that are too complex or computationally expensive to use as pre-filters, like sorting by a specific field or applying additional text-based filters on the returned results. You cannot apply post-filtering to a FAISS index directly, so it must be done in MongoDB.
+
+-----
+
+### Implementation
+
+The core idea is to create a function that takes both a pre-filter and a post-filter and orchestrates the entire process.
+
+#### Step 1: Set up the Scalable FAISS Index
+
+This step is identical to the one in the previous response. You must have a pre-built and persisted FAISS HNSW index and a mapping from FAISS integer IDs to MongoDB `_id`s loaded into memory.
+
+```python
+import faiss
+import numpy as np
+import pickle
+from pymongo import MongoClient
+
+# Assumes you have already built and saved these files
+FAISS_INDEX_PATH = "my_hnsw_index.faiss"
+ID_MAPPING_PATH = "faiss_to_mongo_id.pkl"
+
+# Load the saved FAISS index
+hnsw_index = faiss.read_index(FAISS_INDEX_PATH)
+
+# Load the ID mapping and create a reverse mapping
+with open(ID_MAPPING_PATH, "rb") as f:
+    faiss_to_mongo_id = pickle.load(f)
+mongo_to_faiss_id = {v: k for k, v in faiss_to_mongo_id.items()}
+
+client = MongoClient("mongodb://localhost:27017/")
+collection = client["my_vector_db"]["documents"]
+```
+
+#### Step 2: Implement the Hybrid Search Function
+
+The function `hybrid_search` will now accept both pre-filter and post-filter criteria. It will use MongoDB's aggregation pipeline for the post-filtering stage.
+
+```python
+def hybrid_search(query_embedding, pre_filter, post_filter=None, k=5):
+    """
+    Performs a hybrid search with both pre-filtering and post-filtering.
+    
+    Args:
+        query_embedding (list): The query vector.
+        pre_filter (dict): MongoDB query for pre-filtering metadata.
+        post_filter (list, optional): MongoDB aggregation pipeline stages for post-filtering.
+        k (int): The number of nearest neighbors to find.
+    """
+    # 1. Pre-filter in MongoDB
+    # This is the most critical performance step. We only fetch document IDs.
+    filtered_docs = list(collection.find(pre_filter, projection={"_id": 1}))
+    if not filtered_docs:
+        print("No documents matched the pre-filter criteria.")
+        return []
+
+    # 2. Map MongoDB _ids to FAISS internal IDs
+    filtered_faiss_ids = np.array([
+        mongo_to_faiss_id[str(doc["_id"])]
+        for doc in filtered_docs if str(doc["_id"]) in mongo_to_faiss_id
+    ]).astype("int64")
+
+    if not filtered_faiss_ids.size:
+        print("No FAISS IDs found for the filtered documents.")
+        return []
+
+    # 3. Perform the FAISS HNSW search on the pre-filtered IDs
+    query_embedding_np = np.array([query_embedding]).astype("float32")
+    
+    # You might want to tune efSearch here
+    hnsw_index.hnsw.efSearch = 128
+    
+    distances, indices = hnsw_index.search_with_ids(query_embedding_np, k, filtered_faiss_ids)
+
+    # 4. Map the results back to MongoDB documents
+    result_faiss_ids = [idx for idx in indices[0] if idx != -1]
+    result_mongo_ids = [faiss_to_mongo_id[idx] for idx in result_faiss_ids]
+
+    if not result_mongo_ids:
+        print("FAISS search returned no results.")
+        return []
+    
+    # 5. Build the aggregation pipeline for post-filtering
+    # Start with a $match stage to select the documents from the FAISS results
+    pipeline = [
+        {"$match": {"_id": {"$in": [ObjectId(id) for id in result_mongo_ids]}}}
+    ]
+    
+    # Add optional post-filtering stages if provided
+    if post_filter:
+        pipeline.extend(post_filter)
+        
+    # The final stage for sorting by similarity score if needed.
+    # We can't use the FAISS score directly in MongoDB, but we could
+    # fetch the scores and do an in-application sort. For a true pipeline,
+    # we would apply other sorts like by 'price' or 'date'.
+    
+    # 6. Execute the aggregation pipeline to get the final results
+    results = list(collection.aggregate(pipeline))
+    
+    return results
+```
+
+#### Example Usage
+
+Here's how you'd use the function to combine both pre-filtering and post-filtering. Let's say you have a collection of product documents with `category`, `price`, and `embedding` fields.
+
+```python
+from bson.objectid import ObjectId
+
+# --- Example of a query with both pre- and post-filters ---
+query_vec = np.random.rand(1536).tolist()
+
+# Pre-filter: Only search documents in the 'electronics' category with a price > $500
+pre_filter_criteria = {
+    "category": "electronics",
+    "price": {"$gt": 500}
+}
+
+# Post-filter: Sort the top k results by 'price' in descending order
+post_filter_pipeline = [
+    {"$sort": {"price": -1}},
+    {"$limit": 5} # Final limit on the number of documents to return
+]
+
+search_results = hybrid_search(
+    query_vec,
+    pre_filter=pre_filter_criteria,
+    post_filter=post_filter_pipeline,
+    k=100  # A larger number of candidates to get more results before post-filtering
+)
+
+print("\nHybrid Search Results (pre-filtered by category/price, post-filtered by price):")
+for doc in search_results:
+    print(f"Content: {doc['content']}, Category: {doc['category']}, Price: ${doc['price']:.2f}")
+
+```
+
+This approach, while not as seamless as Atlas's single `$vectorSearch` stage, successfully separates the filtering logic and orchestrates it to achieve the same result. The pre-filter significantly reduces the search space for FAISS, and the post-filter uses MongoDB's native aggregation framework to refine the final, small result set.

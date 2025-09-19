@@ -1,0 +1,153 @@
+if we ever get eccon reset on mongo compass open cmd as Admin and then do:
+net start MongoDB
+
+this starts the mongodb service.
+
+
+this is how to run scripts:
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser #allows local or only signed internet scripts to run
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope CurrentUser #allows all scripts to run
+
+
+
+
+
+Yes, you can implement a pre-filtering approach using MongoDB and FAISS. This is the recommended method for an efficient hybrid search, as it leverages MongoDB's powerful query engine for filtering and FAISS's speed for vector search.
+
+The core idea is to first filter your data in MongoDB based on metadata, retrieve the embeddings and their unique document IDs for only the filtered documents, and then use FAISS's search_with_ids method to perform the similarity search on that specific subset of vectors.
+
+Here's the implementation:
+
+Step 1: Store Embeddings in MongoDB
+First, you need a MongoDB collection where each document contains both the metadata and its vector embedding. A unique identifier (_id) is crucial for linking the FAISS index to the MongoDB documents.
+
+Python
+
+import pymongo
+from pymongo import MongoClient
+import numpy as np
+import uuid
+
+# Connect to your local MongoDB instance
+client = MongoClient("mongodb://localhost:27017/")
+db = client["my_vector_db"]
+collection = db["documents"]
+
+# Sample data with embeddings and metadata
+sample_docs = [
+    {
+        "_id": str(uuid.uuid4()),
+        "content": "A story about a cat and a dog.",
+        "category": "pets",
+        "embedding": np.random.rand(1536).tolist()
+    },
+    {
+        "_id": str(uuid.uuid4()),
+        "content": "The latest news on space exploration.",
+        "category": "science",
+        "embedding": np.random.rand(1536).tolist()
+    },
+    {
+        "_id": str(uuid.uuid4()),
+        "content": "Tips for gardening in the spring.",
+        "category": "hobbies",
+        "embedding": np.random.rand(1536).tolist()
+    },
+    {
+        "_id": str(uuid.uuid4()),
+        "content": "A guide to caring for your new puppy.",
+        "category": "pets",
+        "embedding": np.random.rand(1536).tolist()
+    }
+]
+
+# Insert documents into the collection
+if collection.count_documents({}) == 0:
+    collection.insert_many(sample_docs)
+    print("Sample data inserted.")
+Step 2: Build and Populate the FAISS Index
+FAISS requires all vectors to be in a single NumPy array. You'll need to create a mapping between the FAISS integer indices and the MongoDB _ids. This is the most critical part of this architecture.
+
+Python
+
+import faiss
+
+# Retrieve all documents to build the index
+all_docs = list(collection.find({}, projection={"embedding": 1, "_id": 1}))
+
+# Create a numpy array of embeddings and a list of IDs
+embeddings = np.array([doc["embedding"] for doc in all_docs]).astype("float32")
+doc_ids = np.array([int(i) for i in range(len(all_docs))]).astype("int64")
+
+# Create a FAISS index with an ID map
+# IndexFlatL2 is a simple brute-force index
+# IndexIDMap adds a layer to map the internal index to a custom ID
+faiss_index = faiss.IndexIDMap(faiss.IndexFlatL2(embeddings.shape[1]))
+faiss_index.add_with_ids(embeddings, doc_ids)
+
+# Create a reverse lookup from the integer index to the MongoDB document ID
+faiss_to_mongo_id = {i: str(doc["_id"]) for i, doc in enumerate(all_docs)}
+
+print(f"FAISS index created with {faiss_index.ntotal} vectors.")
+Note: We're using IndexIDMap to handle custom IDs, which simplifies the process. The FAISS index will store the MongoDB _id as a 64-bit integer, so you'll need to handle the conversion. For UUIDs, you might need a separate mapping dictionary as IndexIDMap expects an integer ID. The above code simplifies this by using an integer counter as a temporary ID. A better approach for UUIDs is to maintain a separate dictionary.
+
+Step 3: Perform the Pre-filtered Search
+This is where the magic happens. You'll execute a MongoDB query first, then perform a targeted FAISS search on the results.
+
+Python
+
+def filtered_faiss_search(query_embedding, filter_criteria, k=5):
+    """
+    Performs a hybrid search: first filters documents in MongoDB,
+    then searches the FAISS index on the filtered subset.
+    """
+    # 1. Pre-filter in MongoDB
+    # This is an efficient, database-level operation
+    filtered_docs = list(collection.find(filter_criteria, projection={"embedding": 1, "_id": 1}))
+
+    if not filtered_docs:
+        print("No documents matched the filter criteria.")
+        return []
+
+    # 2. Get the FAISS indices for the filtered documents
+    # Using the separate mapping dictionary from step 2
+    # In a real-world scenario, you would have an ID mapping
+    # that converts the MongoDB _id to the FAISS index.
+    
+    # Create a temporary list of embeddings for the filtered subset
+    filtered_embeddings = np.array([doc["embedding"] for doc in filtered_docs]).astype("float32")
+
+    # Perform a search on the subset. FAISS's search() can take a subset of vectors to search against.
+    # However, the `IndexIDMap` doesn't support searching on a subset directly.
+    # The most robust way is to build a temporary index for the filtered results.
+    
+    temp_faiss_index = faiss.IndexFlatL2(filtered_embeddings.shape[1])
+    temp_faiss_index.add(filtered_embeddings)
+    
+    # Perform the search on the temporary index
+    query_embedding_np = np.array([query_embedding]).astype("float32")
+    distances, indices = temp_faiss_index.search(query_embedding_np, k)
+
+    # 3. Map the results back to MongoDB documents
+    # The returned indices correspond to the order in `filtered_docs`
+    result_doc_ids = [filtered_docs[i]["_id"] for i in indices[0]]
+    
+    # Retrieve the full documents from MongoDB based on the IDs
+    results = list(collection.find({"_id": {"$in": result_doc_ids}}))
+    
+    return results
+
+# --- Example Usage ---
+
+# Simulate a query for a "pet" document
+query_vec = np.random.rand(1536).tolist()
+
+# Define a filter to search only within the "pets" category
+my_filter = {"category": "pets"}
+
+# Perform the hybrid search
+search_results = filtered_faiss_search(query_vec, my_filter, k=2)
+
+print("\nSearch results (filtered by 'pets' category):")
+for doc in search_results:
+    print(f"Content: {doc['content']}, Category: {doc['category']}")
